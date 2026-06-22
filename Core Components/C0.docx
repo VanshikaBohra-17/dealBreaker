@@ -1,0 +1,460 @@
+COMPONENT 0 — EMAIL INGESTION PIPELINE
+REWRITTEN AGAINST MASTER ARCHITECTURE
+
+---
+
+WHAT THIS COMPONENT DOES IN SIMPLE TERMS
+
+Component 0 is the front door of ContextIQ. Everything starts here. It connects to Outlook mailboxes, pulls emails securely, cleans them, strips and pseudonymises PII, stores them in PostgreSQL, seeds the knowledge graph in Neo4j, and queues them for intelligence processing via Celery.
+
+No commitment extraction happens here. No contradiction detection. No AI reasoning. This component's only job is to get clean, secure, structured email data into your system reliably. Everything else depends on this being solid.
+
+Think of it like a water treatment plant. Raw water comes in. It gets filtered, cleaned, and made safe. Then it flows to the rest of the city. If the treatment plant is broken, nothing downstream works.
+
+---
+
+ROI OF COMPONENT 0
+
+This component has no direct business output. Users never see it working. But its ROI is foundational.
+
+Without it — zero emails in the system. Every other component starves.
+
+With it done well — every other component gets clean, consistent, secure data without worrying about where it came from or whether it's safe to process. That separation of concerns is what makes the rest of the system buildable by one person without going insane.
+
+For interviews — being able to explain your ingestion architecture shows you understand production systems, not just AI models. Most candidates who build AI projects skip this layer entirely and use static CSV files. You don't. That distinction matters.
+
+---
+
+WHO ELSE DOES THIS AND HOW
+
+Microsoft Copilot — native access. No API needed. It lives inside Microsoft 365 and reads mailboxes directly. You can't replicate this without being Microsoft.
+
+Zapier and Make — use Microsoft Graph API with OAuth exactly like you will. No-code tools but identical underlying mechanism. Their ingestion is shallow — they trigger on new emails but don't do deep thread reconstruction or PII handling.
+
+Nylas — a commercial email API abstraction layer that sits on top of Microsoft Graph API and Gmail API simultaneously. Handles OAuth complexity for you. Worth knowing about for interviews — "I could have used Nylas but chose to implement Graph API directly for deeper control and to avoid vendor dependency."
+
+Your advantage over all of these — none of them pseudonymise PII at ingestion time, build knowledge graph nodes for every email, or feed into a governance layer. You do all three simultaneously.
+
+---
+
+FULL PIPELINE STEP BY STEP
+
+Step 1 — Workspace and Mailbox Registration
+
+Before any email is touched, a workspace must exist and a mailbox must be registered to it. This is the entry point for all data.
+
+A Workspace Admin logs into ContextIQ and creates a workspace. This writes one row to the workspace table in PostgreSQL. It also creates a namespace in Neo4j for this workspace — every graph node and edge for this workspace will carry this namespace, preventing cross-tenant data leakage.
+
+The admin then registers an Outlook mailbox. This triggers the OAuth 2.0 flow via MSAL. The user logs into Microsoft's login page, grants Mail.Read permission, and MSAL returns an access token and refresh token. Both are immediately encrypted using Azure Key Vault before being stored in the mailbox table. Raw tokens never touch your database.
+
+A workspace_user record is created for the admin with role ADMIN. Audit log entry written — action MAILBOX_ADDED, resource mailbox, outcome SUCCESS.
+
+Step 2 — Initial Email Fetch
+
+First time a mailbox is registered, fetch all existing emails. This is the historical backfill.
+
+Call Microsoft Graph API endpoint — https://graph.microsoft.com/v1.0/me/messages with parameters $top equals 50, $orderby equals sentDateTime desc, $select equals id,subject,body,from,toRecipients,ccRecipients,sentDateTime,conversationId,conversationIndex,importance,hasAttachments.
+
+Why $select — only request the fields you need. Reduces payload size, reduces latency, reduces cost.
+
+Why $top equals 50 — fetch in pages of 50 to avoid rate limiting. Microsoft Graph API allows up to 999 per page but 50 is safer for a portfolio project and easier to process in memory.
+
+Use delta query from the first fetch — store the deltaToken returned by Microsoft. Every subsequent fetch uses this token to get only new or changed emails since the last sync. This is your incremental sync mechanism.
+
+Step 3 — PII Detection and Pseudonymisation
+
+Every email body passes through Microsoft Presidio before anything else happens. This is the security gate. No email content touches your database in raw form until PII is handled.
+
+Presidio's AnalyzerEngine scans the text for PII entities — person names, email addresses, phone numbers, credit card numbers, national IDs, dates of birth, addresses.
+
+For each detected PII entity — generate a UUID token. Store the mapping in the pii_vault table — original value encrypted with AES-256 via Azure Key Vault, token stored in the main column. Replace the PII in the email body with the token.
+
+Example — "Sarah Johnson will deliver the report" becomes "USR_7f3a9b will deliver the report."
+
+The sender email address in the from field is also tokenised. Same for recipients and CC fields. Every person reference in your system is a token from this point forward.
+
+Store the pseudonymised body as body_clean. Store the original body encrypted as body_raw_encrypted. The original is kept only for audit purposes with strict access controls.
+
+Step 4 — Email Cleaning
+
+After PII pseudonymisation, clean the email body further.
+
+Use BeautifulSoup to strip HTML tags from emails sent in HTML format. Most Outlook emails are HTML under the hood.
+
+Use email-reply-parser to remove quoted previous emails from reply chains. Each email should only contain the new content added by the sender, not the entire history of the thread repeated.
+
+Strip common signature patterns — text following "Regards,", "Thanks,", "Best,", "Sincerely," followed by a name pattern.
+
+Strip legal disclaimers — long blocks of text containing phrases like "This email and any attachments are confidential" are boilerplate and carry no business information.
+
+What remains after cleaning is body_clean — the actual meaningful content of this specific email, pseudonymised and stripped of noise. This is what every downstream component receives.
+
+Step 5 — Thread Reconstruction
+
+Microsoft gives you a conversationId for each email. All emails sharing the same conversationId belong to the same thread.
+
+Check if a thread_id already exists in your email_thread table for this conversationId. If yes — this email is a reply in an existing thread. Update last_email_at and email_count on the thread record. If no — this is the first email in a new thread. Create a new email_thread record.
+
+Store the email in email_message table with the thread_id foreign key linking it to its thread.
+
+Step 6 — Entity Extraction for Thread Linking
+
+Run spaCy's named entity recognition on body_clean to extract entities — dates, person names as tokens, organisation names, locations, project-like noun phrases.
+
+For each extracted entity — check if it already exists in thread_entity table for this workspace. If yes — update last_mentioned_at and mention_count. If no — create new thread_entity record.
+
+This builds the entity index that Component 0's cross-thread linking uses. When two threads mention the same entity — "June 24" appears in Thread A and Thread B — they become candidates for thread relationship detection.
+
+Run thread relationship candidate detection using rules — do any existing threads share entities with this new email's thread? If yes, create thread_relationship records with detection_method RULE_BASED and appropriate confidence scores. No LLM involved here.
+
+Step 7 — Knowledge Graph Seeding
+
+For every email processed, write corresponding nodes and edges to Neo4j.
+
+Create or update Person node for sender — properties token, display_name, email_domain, workspace_id.
+Create or update Thread node if new thread — properties thread_id, subject, workspace_id.
+Create email_message node — properties message_id, sent_at, workspace_id.
+Create SENT edge from Person to Thread — person sent an email in this thread.
+Create INVOLVES edges from Thread to every recipient Person node.
+Create MENTIONS edges from Thread to any Topic nodes matching extracted entities.
+
+Store the Neo4j node IDs back in your PostgreSQL records — kg_node_id columns. This gives you direct graph lookups without additional matching logic later.
+
+Step 8 — Queue for Intelligence Processing
+
+After successful storage in PostgreSQL and Neo4j, publish a Celery task to the intelligence queue.
+
+Task payload — message_id, thread_id, workspace_id, project_id if already assigned.
+
+Component 1 — commitment extraction — picks this task up asynchronously. Component 0 is done. It doesn't wait for extraction to complete. Fire and forget into the queue.
+
+Write sync_log entry — emails_fetched, emails_processed, emails_failed, cost_tokens_used, status SUCCESS or PARTIAL.
+
+Step 9 — Incremental Sync Scheduling
+
+After initial backfill, schedule incremental syncs using Celery Beat.
+
+Default sync frequency — every 15 minutes per mailbox. Configurable per workspace.
+
+Each sync uses the stored delta_token to fetch only emails changed since last sync. Update delta_token after each successful sync.
+
+Handle Microsoft Graph API errors gracefully —
+429 Too Many Requests — exponential backoff, retry after Retry-After header value.
+401 Unauthorised — token expired, refresh via MSAL, retry once. If refresh fails, mark mailbox sync_status as TOKEN_EXPIRED and alert workspace admin.
+503 Service Unavailable — Microsoft outage, retry with exponential backoff up to 3 times then mark as SYNC_FAILED.
+
+---
+
+FOLDER AND FILE STRUCTURE
+
+This is your complete project directory for Component 0. Every file, what it contains, why it exists.
+
+contextiq/
+├── docker-compose.yml
+├── .env
+├── .env.example
+├── requirements.txt
+├── alembic.ini
+├── README.md
+│
+├── alembic/
+│   └── versions/
+│       └── 001_initial_schema.py
+│
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config.py
+│   ├── dependencies.py
+│   │
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── security.py
+│   │   ├── encryption.py
+│   │   ├── audit.py
+│   │   └── exceptions.py
+│   │
+│   ├── db/
+│   │   ├── __init__.py
+│   │   ├── postgres.py
+│   │   ├── neo4j.py
+│   │   ├── redis.py
+│   │   └── models/
+│   │       ├── __init__.py
+│   │       ├── workspace.py
+│   │       ├── mailbox.py
+│   │       ├── email_thread.py
+│   │       ├── email_message.py
+│   │       ├── sync_log.py
+│   │       ├── thread_relationship.py
+│   │       ├── thread_entity.py
+│   │       ├── workspace_user.py
+│   │       ├── project.py
+│   │       ├── pii_vault.py
+│   │       ├── audit_log.py
+│   │       └── consent_record.py
+│   │
+│   ├── ingestion/
+│   │   ├── __init__.py
+│   │   ├── providers/
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py
+│   │   │   ├── outlook.py
+│   │   │   └── gmail.py
+│   │   ├── cleaner.py
+│   │   ├── thread_builder.py
+│   │   ├── entity_extractor.py
+│   │   └── thread_linker.py
+│   │
+│   ├── security/
+│   │   ├── __init__.py
+│   │   ├── pii_handler.py
+│   │   ├── vault.py
+│   │   └── key_vault.py
+│   │
+│   ├── graph/
+│   │   ├── __init__.py
+│   │   ├── seeder.py
+│   │   └── queries.py
+│   │
+│   ├── tasks/
+│   │   ├── __init__.py
+│   │   ├── celery_app.py
+│   │   ├── ingestion_tasks.py
+│   │   └── scheduled_tasks.py
+│   │
+│   └── api/
+│       ├── __init__.py
+│       ├── routers/
+│       │   ├── __init__.py
+│       │   ├── workspaces.py
+│       │   ├── mailboxes.py
+│       │   └── auth.py
+│       └── schemas/
+│           ├── __init__.py
+│           ├── workspace.py
+│           ├── mailbox.py
+│           └── auth.py
+│
+└── tests/
+    ├── __init__.py
+    ├── conftest.py
+    ├── unit/
+    │   ├── __init__.py
+    │   ├── test_cleaner.py
+    │   ├── test_pii_handler.py
+    │   ├── test_entity_extractor.py
+    │   ├── test_thread_linker.py
+    │   └── test_thread_builder.py
+    └── integration/
+        ├── __init__.py
+        ├── test_ingestion_pipeline.py
+        └── test_graph_seeder.py
+
+---
+
+WHAT GOES IN EACH FILE
+
+docker-compose.yml — defines all services for local development. PostgreSQL, Neo4j, Redis, your FastAPI app, Celery worker, Celery Beat scheduler. One command — docker-compose up — starts everything locally.
+
+.env — your secrets and configuration. Never committed to Git. Contains Azure Key Vault URL, Microsoft Graph API credentials, PostgreSQL connection string, Neo4j credentials, Redis URL, Azure OpenAI key.
+
+.env.example — same structure as .env but with placeholder values. This IS committed to Git so collaborators know what variables are needed without seeing your actual secrets.
+
+requirements.txt — all Python dependencies. Key ones for Component 0 — fastapi, uvicorn, sqlalchemy, alembic, psycopg2-binary, pgvector, neo4j, redis, celery, msal, requests, beautifulsoup4, email-reply-parser, spacy, presidio-analyzer, presidio-anonymizer, azure-keyvault-secrets, azure-identity, cryptography, pydantic, python-dotenv, structlog.
+
+alembic.ini — configuration for Alembic database migrations. Points to your PostgreSQL connection string.
+
+alembic/versions/001_initial_schema.py — your first database migration. Creates all tables in the correct order respecting foreign key constraints. Runs with one command — alembic upgrade head.
+
+app/main.py — FastAPI application entry point. Registers all routers. Sets up startup and shutdown events — database connection pool initialisation, Neo4j connection, Redis connection.
+
+app/config.py — reads all environment variables using pydantic-settings. Single source of truth for all configuration. Every other file imports settings from here, never reads environment variables directly.
+
+app/dependencies.py — FastAPI dependency injection functions. get_db returns a PostgreSQL session. get_neo4j returns a Neo4j session. get_current_user reads JWT token from request header and returns the authenticated user. get_redis returns Redis client. These are injected into API route handlers automatically by FastAPI.
+
+app/core/security.py — JWT token creation and verification for your own API authentication. Separate from Microsoft OAuth — this is how your frontend authenticates to your ContextIQ backend.
+
+app/core/encryption.py — AES-256 encryption and decryption functions using Azure Key Vault managed keys. Used by pii_handler and anywhere sensitive data is stored.
+
+app/core/audit.py — write_audit_log function. Called by every sensitive operation throughout the system. Takes action_type, resource_type, resource_id, outcome, user_token. Writes to audit_log table. Never throws exceptions — audit logging failure should never break the main operation.
+
+app/core/exceptions.py — custom exception classes. IngestionError, PiiHandlingError, GraphSeedingError, TokenRefreshError. Structured exceptions with error codes that map to HTTP responses.
+
+app/db/postgres.py — SQLAlchemy engine and session factory. Connection pooling via PgBouncer URL. Session lifecycle management.
+
+app/db/neo4j.py — Neo4j driver initialisation. Connection pooling. Session factory.
+
+app/db/redis.py — Redis client initialisation. Connection pooling.
+
+app/db/models/ — one file per database table. Each file contains a SQLAlchemy model class defining the table schema. These models are what Alembic reads to generate migrations.
+
+app/ingestion/providers/base.py — abstract EmailProvider class. Defines the interface — fetch_messages, get_thread, mark_processed, get_delta. No implementation here.
+
+app/ingestion/providers/outlook.py — OutlookProvider class inheriting from EmailProvider. All Microsoft Graph API logic lives here. MSAL authentication, token refresh, delta query, pagination, error handling. Returns standardised EmailMessage objects regardless of Microsoft's response format.
+
+app/ingestion/providers/gmail.py — GmailProvider stub. Has the class definition and method signatures but raises NotImplementedError for everything. Shows the adapter pattern is designed even though Gmail isn't implemented. Perfect interview talking point.
+
+app/ingestion/cleaner.py — EmailCleaner class. Takes raw email body. Strips HTML with BeautifulSoup. Removes quoted replies with email-reply-parser. Strips signatures. Strips legal disclaimers. Returns clean text.
+
+app/ingestion/thread_builder.py — ThreadBuilder class. Takes an email and builds or updates thread records in PostgreSQL. Handles conversationId grouping. Updates email counts and timestamps.
+
+app/ingestion/entity_extractor.py — EntityExtractor class. Takes clean email body. Runs spaCy NER. Returns list of extracted entities with types and values.
+
+app/ingestion/thread_linker.py — ThreadLinker class. Takes extracted entities and current thread. Applies four rules to find candidate thread relationships. Creates thread_relationship records for matches.
+
+app/security/pii_handler.py — PiiHandler class. Takes raw email body. Runs Presidio analyzer to find PII. For each entity — calls vault to get or create token. Replaces PII in text with tokens. Returns pseudonymised text and list of replacements made.
+
+app/security/vault.py — PiiVault class. Manages pii_vault table. get_or_create_token takes entity type and value, returns existing token or creates new one. reverse_token takes token and returns original value — only callable by authorised roles, writes to audit log every time.
+
+app/security/key_vault.py — AzureKeyVaultClient class. Wraps azure-keyvault-secrets. get_secret, set_secret, delete_secret methods. Used by encryption.py and vault.py. All Azure Key Vault interactions go through this class.
+
+app/graph/seeder.py — GraphSeeder class. Takes processed email data. Creates or updates Person, Thread, Message nodes in Neo4j. Creates SENT, INVOLVES, MENTIONS edges. Stores Neo4j node IDs back in PostgreSQL records.
+
+app/graph/queries.py — predefined Cypher queries for Component 0 specific graph operations. find_person_by_token, create_thread_node, link_person_to_thread. Later components add their own queries to this file.
+
+app/tasks/celery_app.py — Celery application initialisation. Configures Redis as broker. Defines four queues — ingestion, intelligence, analytics, notifications. Sets task retry policies and dead letter queue.
+
+app/tasks/ingestion_tasks.py — Celery tasks for ingestion. process_mailbox_sync task — called per mailbox per sync cycle. process_single_email task — called per email. Each task is atomic — if it fails, only that email or that mailbox sync fails, not the entire batch.
+
+app/tasks/scheduled_tasks.py — Celery Beat scheduled tasks. sync_all_mailboxes runs every 15 minutes. Fetches all active mailboxes from PostgreSQL. Dispatches process_mailbox_sync task for each one.
+
+app/api/routers/workspaces.py — FastAPI router for workspace CRUD. POST /workspaces creates workspace. GET /workspaces lists workspaces for current user. All routes require authentication. Admin only routes use RBAC dependency.
+
+app/api/routers/mailboxes.py — FastAPI router for mailbox management. POST /workspaces/{id}/mailboxes triggers OAuth flow and registers mailbox. GET /workspaces/{id}/mailboxes lists mailboxes. DELETE /workspaces/{id}/mailboxes/{mailbox_id} revokes token and removes mailbox.
+
+app/api/routers/auth.py — FastAPI router for authentication. POST /auth/login returns JWT. POST /auth/refresh refreshes JWT. POST /auth/logout revokes session.
+
+app/api/schemas/ — Pydantic schemas for request and response validation. Separate from SQLAlchemy models. Request schemas validate incoming data. Response schemas control what gets returned — never expose raw database models directly to API consumers.
+
+tests/conftest.py — pytest fixtures shared across all tests. test_db fixture creates an in-memory test database. test_client fixture creates a FastAPI test client. mock_graph fixture mocks Neo4j. mock_redis fixture mocks Redis. mock_presidio fixture mocks PII detection.
+
+tests/unit/test_cleaner.py — tests for EmailCleaner. Test HTML stripping. Test quoted reply removal. Test signature stripping. Test legal disclaimer removal. All tests use static email strings — no external dependencies.
+
+tests/unit/test_pii_handler.py — tests for PiiHandler. Test that person names are pseudonymised. Test that email addresses are tokenised. Test that the same entity always gets the same token. Test that cleaned text contains no original PII. Mock Presidio and vault calls.
+
+tests/unit/test_entity_extractor.py — tests for EntityExtractor. Test date extraction. Test person name extraction as tokens. Test that extraction works on various email formats. Mock spaCy to avoid loading model in unit tests.
+
+tests/unit/test_thread_linker.py — tests for ThreadLinker. Test each of the four linking rules independently. Test that low confidence matches don't create relationships. Test that cross-workspace matching is prevented.
+
+tests/unit/test_thread_builder.py — tests for ThreadBuilder. Test new thread creation. Test existing thread update. Test email count increment. Test conversationId grouping.
+
+tests/integration/test_ingestion_pipeline.py — end to end test of full pipeline. Uses test database. Mocks Microsoft Graph API responses with realistic email JSON. Verifies emails correctly land in PostgreSQL with PII pseudonymised. Verifies thread relationships created correctly.
+
+tests/integration/test_graph_seeder.py — integration test for Neo4j seeding. Uses test Neo4j instance. Verifies Person nodes created. Verifies Thread nodes created. Verifies edges created correctly. Verifies node IDs stored back in PostgreSQL.
+
+---
+
+TECH STACK FOR COMPONENT 0 — COMPLETE
+
+FastAPI — REST API framework. Async native.
+SQLAlchemy 2.0 — ORM for PostgreSQL.
+Alembic — database migrations.
+psycopg2-binary — PostgreSQL adapter for Python.
+pgvector — PostgreSQL extension. Enabled in migration 001.
+Neo4j Python driver — graph database communication.
+Redis — caching and Celery broker.
+Celery — async task queue.
+MSAL — Microsoft Authentication Library for OAuth.
+requests — HTTP calls to Microsoft Graph API.
+BeautifulSoup4 — HTML stripping.
+email-reply-parser — quoted reply removal.
+spaCy with en_core_web_sm model — NER for entity extraction.
+Microsoft Presidio — PII detection and pseudonymisation.
+azure-keyvault-secrets — Azure Key Vault integration.
+azure-identity — Azure authentication for Key Vault.
+cryptography — AES-256 encryption.
+pydantic-settings — environment variable management.
+python-dotenv — .env file loading.
+structlog — structured JSON logging.
+PyJWT — JWT authentication for your own API.
+pytest plus pytest-asyncio — testing.
+factory-boy — test data generation.
+responses — HTTP mocking for Graph API tests.
+
+---
+
+BLOCKERS YOU WILL HIT AND HOW TO SOLVE THEM
+
+Blocker 1 — OAuth flow is confusing to set up the first time.
+Solution — follow Microsoft's official Python quickstart for Graph API exactly. Register your app in Azure Portal, get Client ID, Client Secret, Tenant ID. Set redirect URI to http://localhost:8000/auth/callback for development. Don't try to understand every OAuth concept before starting. Get it working first.
+
+Blocker 2 — Presidio false positives. It flags things as PII that aren't. For example — "Python" might get flagged as a person name.
+Solution — configure Presidio with a custom deny list of technical terms and product names. Tune the confidence threshold — only pseudonymise entities where Presidio confidence is above 0.7. Accept that some false positives will occur and document this as a known limitation.
+
+Blocker 3 — Neo4j and PostgreSQL writes need to be atomic. If PostgreSQL write succeeds but Neo4j write fails, your data is inconsistent.
+Solution — implement a two phase approach. Write to PostgreSQL first with kg_synced equals false. Then write to Neo4j. If Neo4j succeeds, update kg_synced to true. A background reconciliation job runs hourly — finds all records where kg_synced is false and retries Neo4j write. Eventual consistency rather than strict atomicity. Document this tradeoff explicitly.
+
+Blocker 4 — spaCy model download in Docker.
+Solution — add RUN python -m spacy download en_core_web_sm to your Dockerfile. This downloads the model during image build, not at runtime.
+
+Blocker 5 — Celery tasks failing silently.
+Solution — always log task start, task success, and task failure with structlog in every Celery task function. Set up a dead letter queue in your Celery config. Monitor queue depth in your metrics. A task that fails silently means emails never get processed and you won't know.
+
+Blocker 6 — Email body encoding issues. Emails arrive in various encodings — UTF-8, Latin-1, Windows-1252. Non-UTF-8 characters cause crashes.
+Solution — always decode email bodies with errors equals replace parameter. Add body_encoding column to email_message table recording detected encoding. Log encoding issues for monitoring.
+
+Blocker 7 — Azure Key Vault cold start latency. First request to Key Vault after idle period takes 2 to 3 seconds.
+Solution — warm up Key Vault connection on application startup. Cache frequently used keys in memory for 5 minutes using Redis. Never call Key Vault on the hot path of a user-facing API request.
+
+---
+
+HOW AI LAST PRINCIPLE SHOWS UP IN COMPONENT 0
+
+Component 0 is entirely rule based and deterministic. Zero LLM calls. Zero AI.
+
+Thread grouping — rule. Microsoft conversationId groups emails. No AI needed.
+PII detection — Microsoft Presidio is a rule based NLP tool with ML models underneath but no LLM. Not generative AI. Fast, deterministic, auditable.
+Entity extraction — spaCy NER is a statistical NLP model, not an LLM. Lightweight, local, fast, free.
+Thread linking — four deterministic rules. Entity overlap, same project, same type, temporal proximity. No AI.
+Email cleaning — rules and regex. No AI.
+
+This entire component processes emails without spending a single Azure OpenAI token. Your LLM budget is preserved entirely for Components 1 through 4 where AI genuinely earns its place.
+
+---
+
+HOW GMAIL EXTENSIBILITY SHOWS UP HERE
+
+app/ingestion/providers/base.py defines the abstract interface. OutlookProvider implements it. GmailProvider stub exists but raises NotImplementedError.
+
+Every other file in the ingestion folder — cleaner.py, thread_builder.py, entity_extractor.py, thread_linker.py — receives standardised EmailMessage objects. They have no idea whether the email came from Outlook or Gmail.
+
+If you implemented GmailProvider, you would change exactly one line — the provider instantiation in ingestion_tasks.py. Nothing else changes.
+
+---
+
+CONCEPTS TO STUDY IN ORDER OF PRIORITY
+
+First — OAuth 2.0 flow. Understand authorisation code flow, access tokens, refresh tokens, scopes. One day. Microsoft's own documentation explains this specifically for Graph API.
+
+Second — REST APIs and HTTP. GET POST PUT DELETE. Request headers. JSON responses. Status codes — 200 success, 400 bad request, 401 unauthorised, 429 rate limited, 503 unavailable. Half a day.
+
+Third — SQLAlchemy basics. How to define a model class. How to create a session. How to add, query, update records. One day with their official tutorial.
+
+Fourth — Alembic migrations. How to create a migration. How to run it. How to roll back. Half a day.
+
+Fifth — Docker and Docker Compose. What a container is. What a Dockerfile does. How docker-compose.yml defines multiple services. One day of hands on practice — run PostgreSQL and Redis in Docker locally before writing any code.
+
+Sixth — Celery basics. What a task is. How to define one. How to call it asynchronously. How to monitor it. Half a day with their quickstart guide.
+
+Seventh — spaCy NER basics. What named entity recognition is. How to run it on a string. What entity types are available. Half a day.
+
+Eighth — Microsoft Presidio. How to run the analyzer. How to run the anonymizer. How to configure custom entity types. One day hands on.
+
+Ninth — pytest basics. How to write a test function. How to use fixtures. How to mock external dependencies with unittest.mock. One day.
+
+Tenth — structlog. How to configure it. How to add context to log entries. How to output JSON logs. Half a day.
+
+---
+
+WHAT YOU SHOULD BE ABLE TO DO AFTER BUILDING COMPONENT 0
+
+Run docker-compose up and have all services start cleanly.
+Register a workspace and mailbox through your API.
+Watch emails flow from Outlook into PostgreSQL automatically.
+Verify PII is pseudonymised in body_clean.
+Verify nodes exist in Neo4j browser.
+Verify Celery tasks appear in the intelligence queue.
+Run pytest and see green tests.
+Open Azure Portal and see your application running.
+
